@@ -1,5 +1,9 @@
-# Large digest files
-_digests/*.md
+# Generated data (personal — never commit)
+_digests/
+_digest-pending
+_memory-sync.log
+_backup.log
+_tools-backup.log
 
 # Python
 __pycache__/
