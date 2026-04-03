@@ -16,7 +16,6 @@ import sys
 import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections import defaultdict
 
 # Pre-compiled regexes for performance
 RE_SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
@@ -50,19 +49,25 @@ def find_claude_projects_dir() -> Path:
 
 def folder_to_project_name(folder_name: str) -> str:
     """Convert Claude's folder naming convention back to readable names.
-    Works on any machine — detects the username dynamically."""
+    Works on any machine — handles multi-word usernames (e.g. 'Gaming PC')."""
     name = folder_name
 
-    # Remove common path prefixes (platform-agnostic)
-    # Claude encodes paths as C--Users-USERNAME-... or /home-USERNAME-...
-    # Strip everything up to and including the username portion
+    # Claude encodes paths like: C--Users-Gaming-PC-Desktop-Claude-Finance
+    # The username can be multi-word (Gaming-PC, GAMING-1, John-Doe).
+    # Strategy: strip up to the first known path segment after Users.
+    known_segments = r"(?:Desktop|Documents|Projects|AppData|Downloads|OneDrive)"
+
     patterns = [
-        r"^[A-Z]--Users-[^-]+-Desktop-",  # Windows: C--Users-Name-Desktop-
-        r"^[A-Z]--Users-[^-]+-Documents-",  # Windows: C--Users-Name-Documents-
-        r"^[A-Z]--Users-[^-]+-",  # Windows: C--Users-Name-
-        r"^[A-Z]--Users-[^-]+-[^-]+-",  # Windows with spaces: C--Users-GAMING-1-
-        r"^home-[^-]+-",  # Linux: home-username-
-        r"^Users-[^-]+-",  # macOS: Users-username-
+        # Windows: C--Users-<anything>-<known segment>-rest
+        rf"^[A-Z]--Users-.+?-{known_segments}-",
+        # Windows: C--Users-<anything> (root of user dir, no known segment)
+        r"^[A-Z]--Users-.+?$",
+        # Linux: home-username-rest
+        rf"^home-.+?-{known_segments}-",
+        r"^home-[^-]+-",
+        # macOS: Users-username-rest
+        rf"^Users-.+?-{known_segments}-",
+        r"^Users-[^-]+-",
     ]
 
     for pattern in patterns:
@@ -85,6 +90,22 @@ def folder_to_safe_filename(folder_name: str) -> str:
     name = folder_to_project_name(folder_name)
     safe = re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '-').lower()
     return safe or 'unknown'
+
+
+def extract_content_text(raw_content, include_tools: bool = False) -> str:
+    """Extract text from a message content field (string or block list)."""
+    if isinstance(raw_content, str):
+        return raw_content
+    if not isinstance(raw_content, list):
+        return ""
+    parts = []
+    for block in raw_content:
+        if isinstance(block, dict):
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif include_tools and block.get("type") == "tool_use":
+                parts.append(f"[Tool: {block.get('name', 'unknown')}]")
+    return "\n".join(parts)
 
 
 def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dict]:
@@ -118,42 +139,17 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
                     continue
 
                 entry_type = entry.get("type")
-                role = None
-                content_text = ""
+                if entry_type not in ("user", "assistant"):
+                    continue
 
-                if entry_type == "user":
-                    role = "user"
-                    msg = entry.get("message", {})
-                    if isinstance(msg, dict):
-                        raw_content = msg.get("content", "")
-                        if isinstance(raw_content, str):
-                            content_text = raw_content
-                        elif isinstance(raw_content, list):
-                            parts = []
-                            for block in raw_content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    parts.append(block.get("text", ""))
-                            content_text = "\n".join(parts)
+                msg = entry.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
 
-                elif entry_type == "assistant":
-                    role = "assistant"
-                    msg = entry.get("message", {})
-                    if isinstance(msg, dict):
-                        raw_content = msg.get("content", [])
-                        if isinstance(raw_content, str):
-                            content_text = raw_content
-                        elif isinstance(raw_content, list):
-                            parts = []
-                            for block in raw_content:
-                                if isinstance(block, dict):
-                                    if block.get("type") == "text":
-                                        parts.append(block.get("text", ""))
-                                    elif block.get("type") == "tool_use":
-                                        tool_name = block.get("name", "unknown")
-                                        parts.append(f"[Tool: {tool_name}]")
-                            content_text = "\n".join(parts)
+                raw_content = msg.get("content", "" if entry_type == "user" else [])
+                content_text = extract_content_text(raw_content, include_tools=(entry_type == "assistant"))
 
-                if not role or not content_text.strip():
+                if not content_text.strip():
                     continue
 
                 content_text = RE_SYSTEM_REMINDER.sub("", content_text)
@@ -163,7 +159,7 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
                     continue
 
                 messages.append({
-                    "role": role,
+                    "role": entry_type,
                     "text": content_text,
                     "timestamp": ts,
                 })

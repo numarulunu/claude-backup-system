@@ -20,9 +20,17 @@ memory_sync = importlib.import_module("memory-sync")
 # ---------------------------------------------------------------------------
 
 class TestFolderToProjectName:
-    def test_windows_desktop_path(self):
+    def test_windows_single_word_username(self):
         result = memory_sync.folder_to_project_name("C--Users-JohnDoe-Desktop-MyProject")
         assert result == "MyProject"
+
+    def test_windows_multi_word_username(self):
+        result = memory_sync.folder_to_project_name("C--Users-Gaming-PC-Desktop-Claude-Finance")
+        assert result == "Claude Finance"
+
+    def test_windows_short_username(self):
+        result = memory_sync.folder_to_project_name("C--Users-GAMING-1-AppData-Local-Temp")
+        assert result == "Local Temp"
 
     def test_windows_documents_path(self):
         result = memory_sync.folder_to_project_name("C--Users-JohnDoe-Documents-Work")
@@ -33,10 +41,10 @@ class TestFolderToProjectName:
         assert result == "MyProject"
 
     def test_macos_path(self):
-        result = memory_sync.folder_to_project_name("Users-john-MyProject")
-        assert result == "MyProject"
+        result = memory_sync.folder_to_project_name("Users-jane-Documents-work")
+        assert result == "work"
 
-    def test_nested_path_with_separators(self):
+    def test_nested_path(self):
         result = memory_sync.folder_to_project_name("C--Users-JohnDoe-Desktop-Claude-Finance")
         assert result == "Claude Finance"
 
@@ -52,6 +60,11 @@ class TestFolderToProjectName:
         result = memory_sync.folder_to_project_name("")
         assert result == ""
 
+    def test_user_root_dir_no_match(self):
+        """A bare user dir with no known segment should return as-is."""
+        result = memory_sync.folder_to_project_name("C--Users-Gaming-PC")
+        assert result == "C--Users-Gaming-PC"
+
 
 class TestFolderToSafeFilename:
     def test_basic_conversion(self):
@@ -59,7 +72,7 @@ class TestFolderToSafeFilename:
         assert result == "my-project"
 
     def test_nested_path(self):
-        result = memory_sync.folder_to_safe_filename("C--Users-JohnDoe-Desktop-Claude-Finance")
+        result = memory_sync.folder_to_safe_filename("C--Users-Gaming-PC-Desktop-Claude-Finance")
         assert result == "claude-finance"
 
     def test_special_chars_stripped(self):

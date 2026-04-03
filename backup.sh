@@ -68,14 +68,19 @@ fi
 
 cp "$CLAUDE_DIR/settings.json" "$CONFIG_DIR/settings.json" 2>/dev/null || true
 
-# Sync memory files
+# Sync memory files (all projects that have a memory/ dir)
+MEMORY_FOUND=0
 for memdir in "$PROJECTS_DIR"/*/memory/; do
     if [ -d "$memdir" ]; then
         cp "$memdir"*.md "$CONFIG_DIR/memory/" 2>/dev/null || true
-        log_ok "Memory synced from $memdir"
-        break
+        ((MEMORY_FOUND++))
     fi
 done
+if [ "$MEMORY_FOUND" -gt 0 ]; then
+    log_ok "Memory synced from $MEMORY_FOUND project(s)"
+else
+    log_warn "No memory directories found"
+fi
 
 # Sync conversations
 if cp -ru "$PROJECTS_DIR/" "$CONV_DIR/" 2>/dev/null; then
