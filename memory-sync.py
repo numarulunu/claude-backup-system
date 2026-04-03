@@ -206,11 +206,78 @@ def build_project_digest(project_name: str, conversations: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def run(days: int | None, output_dir: str, extract_all: bool):
+DEFAULT_MAX_SIZE_MB = 5
+
+
+def write_manifest(output_path: Path, project_stats: list, label: str):
+    """Write the digest manifest file."""
+    total_msgs = sum(p["messages"] for p in project_stats)
+    total_size = sum(p["size_kb"] for p in project_stats)
+
+    lines = [
+        f"# Digest Manifest",
+        f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"**Scope:** {label}",
+        f"**Projects:** {len(project_stats)}",
+        f"**Total messages:** {total_msgs}",
+        f"**Total size:** {total_size:.0f}KB",
+        "",
+        "| Project | File | Conversations | Messages | Size |",
+        "|---|---|---|---|---|",
+    ]
+
+    for p in sorted(project_stats, key=lambda x: x["size_kb"], reverse=True):
+        lines.append(f"| {p['name']} | `{Path(p['file']).name}` | {p['conversations']} | {p['messages']} | {p['size_kb']:.0f}KB |")
+
+    manifest_path = output_path / "_manifest.md"
+    manifest_path.write_text("\n".join(lines), encoding="utf-8")
+    return manifest_path, total_msgs, total_size
+
+
+def write_pending_flag(output_path: Path):
+    """Write the digest-pending flag for SessionStart hook."""
+    pending_path = output_path.parent / "_digest-pending"
+    pending_path.write_text(datetime.now().strftime('%Y-%m-%d %H:%M'), encoding="utf-8")
+
+
+def extract_project(project_dir: Path, cutoff: datetime | None) -> tuple[str, str, list]:
+    """Extract conversations from a single project directory."""
+    project_name = folder_to_project_name(project_dir.name)
+    safe_name = folder_to_safe_filename(project_dir.name)
+    jsonl_files = list(project_dir.glob("*.jsonl"))
+    conversations = []
+
+    for jf in jsonl_files:
+        if cutoff:
+            try:
+                mtime = datetime.fromtimestamp(jf.stat().st_mtime, tz=timezone.utc)
+                if mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+
+        messages = parse_jsonl_file(jf, cutoff)
+        if not messages:
+            continue
+
+        messages.sort(key=lambda m: m["timestamp"])
+        conversations.append({
+            "file": jf.name,
+            "messages": messages,
+            "earliest": min(m["timestamp"] for m in messages),
+            "latest": max(m["timestamp"] for m in messages),
+        })
+
+    return project_name, safe_name, conversations
+
+
+def run(days: int | None, output_dir: str, extract_all: bool, max_size_mb: float = DEFAULT_MAX_SIZE_MB):
     """Main extraction logic."""
     claude_projects = find_claude_projects_dir()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    max_size_bytes = int(max_size_mb * 1024 * 1024)
 
     cutoff = None
     if not extract_all:
@@ -220,7 +287,7 @@ def run(days: int | None, output_dir: str, extract_all: bool):
         label = "ALL TIME"
 
     print(f"Claude projects: {claude_projects}", file=sys.stderr)
-    print(f"Scanning conversations ({label})...", file=sys.stderr)
+    print(f"Scanning conversations ({label}, max {max_size_mb}MB per digest)...", file=sys.stderr)
 
     project_stats = []
 
@@ -228,43 +295,43 @@ def run(days: int | None, output_dir: str, extract_all: bool):
         if not project_dir.is_dir():
             continue
 
-        project_name = folder_to_project_name(project_dir.name)
-        safe_name = folder_to_safe_filename(project_dir.name)
-        jsonl_files = list(project_dir.glob("*.jsonl"))
-
-        conversations = []
-
-        for jf in jsonl_files:
-            if cutoff:
-                try:
-                    mtime = datetime.fromtimestamp(jf.stat().st_mtime, tz=timezone.utc)
-                    if mtime < cutoff:
-                        continue
-                except OSError:
-                    continue
-
-            messages = parse_jsonl_file(jf, cutoff)
-            if not messages:
-                continue
-
-            messages.sort(key=lambda m: m["timestamp"])
-            conversations.append({
-                "file": jf.name,
-                "messages": messages,
-                "earliest": min(m["timestamp"] for m in messages),
-                "latest": max(m["timestamp"] for m in messages),
-            })
+        project_name, safe_name, conversations = extract_project(project_dir, cutoff)
 
         if not conversations:
             continue
 
         digest = build_project_digest(project_name, conversations)
+        digest_bytes = len(digest.encode("utf-8"))
+
+        # Cap digest size by dropping oldest sessions
+        if digest_bytes > max_size_bytes and len(conversations) > 1:
+            conversations.sort(key=lambda c: c["latest"], reverse=True)
+            kept = []
+            running_size = 0
+            for conv in conversations:
+                conv_digest = build_project_digest(project_name, [conv])
+                conv_size = len(conv_digest.encode("utf-8"))
+                if running_size + conv_size > max_size_bytes and kept:
+                    break
+                kept.append(conv)
+                running_size += conv_size
+
+            dropped = len(conversations) - len(kept)
+            kept.reverse()
+            digest = build_project_digest(project_name, kept)
+            digest_bytes = len(digest.encode("utf-8"))
+
+            if dropped:
+                note = f"\n\n> **Note:** {dropped} older session(s) trimmed to stay under {max_size_mb}MB limit.\n"
+                digest = digest + note
+
+            print(f"  {project_name}: trimmed {dropped} old session(s) to fit size cap", file=sys.stderr)
 
         digest_file = output_path / f"{safe_name}.md"
         digest_file.write_text(digest, encoding="utf-8")
 
         total_messages = sum(len(c["messages"]) for c in conversations)
-        file_size_kb = len(digest.encode("utf-8")) / 1024
+        file_size_kb = digest_bytes / 1024
 
         project_stats.append({
             "name": project_name,
@@ -280,29 +347,8 @@ def run(days: int | None, output_dir: str, extract_all: bool):
         print(f"No conversations found ({label}).", file=sys.stderr)
         return
 
-    # Write manifest
-    manifest_lines = []
-    manifest_lines.append(f"# Digest Manifest")
-    manifest_lines.append(f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    manifest_lines.append(f"**Scope:** {label}")
-    manifest_lines.append(f"**Projects:** {len(project_stats)}")
-    total_msgs = sum(p["messages"] for p in project_stats)
-    total_size = sum(p["size_kb"] for p in project_stats)
-    manifest_lines.append(f"**Total messages:** {total_msgs}")
-    manifest_lines.append(f"**Total size:** {total_size:.0f}KB")
-    manifest_lines.append("")
-    manifest_lines.append("| Project | File | Conversations | Messages | Size |")
-    manifest_lines.append("|---|---|---|---|---|")
-
-    for p in sorted(project_stats, key=lambda x: x["size_kb"], reverse=True):
-        manifest_lines.append(f"| {p['name']} | `{Path(p['file']).name}` | {p['conversations']} | {p['messages']} | {p['size_kb']:.0f}KB |")
-
-    manifest_path = output_path / "_manifest.md"
-    manifest_path.write_text("\n".join(manifest_lines), encoding="utf-8")
-
-    # Write pending flag
-    pending_path = output_path.parent / "_digest-pending"
-    pending_path.write_text(datetime.now().strftime('%Y-%m-%d %H:%M'), encoding="utf-8")
+    manifest_path, total_msgs, total_size = write_manifest(output_path, project_stats, label)
+    write_pending_flag(output_path)
 
     print(f"\n  TOTAL: {len(project_stats)} projects, {total_msgs} messages, {total_size:.0f}KB", file=sys.stderr)
     print(f"  Manifest: {manifest_path}", file=sys.stderr)
@@ -314,12 +360,14 @@ def main():
     parser.add_argument("--days", type=int, default=1, help="Look back N days (default: 1)")
     parser.add_argument("--all", action="store_true", help="Extract ALL conversations")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
+    parser.add_argument("--max-size", type=float, default=DEFAULT_MAX_SIZE_MB,
+                       help=f"Max digest file size in MB (default: {DEFAULT_MAX_SIZE_MB})")
     args = parser.parse_args()
 
     default_dir = Path(__file__).parent / "_digests"
     output_dir = args.output_dir or str(default_dir)
 
-    run(days=args.days, output_dir=output_dir, extract_all=args.all)
+    run(days=args.days, output_dir=output_dir, extract_all=args.all, max_size_mb=args.max_size)
 
 
 if __name__ == "__main__":
