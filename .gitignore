@@ -1,0 +1,6 @@
+# Large digest files
+_digests/*.md
+
+# System files
+.DS_Store
+Thumbs.db
