@@ -1,6 +1,18 @@
 # Large digest files
 _digests/*.md
 
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+.env
+*.log
+dist/
+build/
+*.egg-info/
+
 # System files
 .DS_Store
 Thumbs.db
+desktop.ini
