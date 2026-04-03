@@ -21,6 +21,7 @@ REPOS=(
   "$HOME/Desktop/Claude/Skool|vocality-skool"
   "$HOME/Desktop/Transcriptor v2|transcriptor-v2"
   "$HOME/Desktop/Claude/UsageBOT|claude-code-usage-dashboard"
+  "$HOME/Desktop/Claude/Backup System|claude-backup-system"
 )
 
 PUSHED=0
