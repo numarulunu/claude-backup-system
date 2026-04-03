@@ -1,49 +1,87 @@
 #!/bin/bash
 set -euo pipefail
 
-# backup.sh — Sync latest files from .claude/ and push to GitHub
-# Runs update-memory.sh first to ensure digest is fresh, then backs up everything.
+# backup.sh — Portable daily backup for Claude Code users
+# Auto-detects Claude config, generates digest, syncs to git, backs up all tool repos.
+# Works on any machine with Claude Code CLI, git, and Python installed.
 #
 # Usage: ./backup.sh [commit message]
 
-CLAUDE_DIR="$HOME/Desktop/Claude"
-CONFIG_DIR="$CLAUDE_DIR/_claude-config"
-CONV_DIR="$CLAUDE_DIR/_conversations"
-MEMORY_SRC="$HOME/.claude/projects/C--Users-Gaming-PC-Desktop-Claude-Personal-Context/memory"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOGFILE="$CLAUDE_DIR/_backup.log"
+LOGFILE="$SCRIPT_DIR/_backup.log"
 
 exec >> "$LOGFILE" 2>&1
 echo "=== Backup — $(date) ==="
 
-# Step 0: Run digest generation first (ensures no race condition)
-echo "  Running digest generation..."
-bash "$SCRIPT_DIR/update-memory.sh" 2>&1 || echo "  WARN: Digest generation had issues, continuing backup..."
+# --- Auto-detect paths ---
+CLAUDE_DIR="$HOME/.claude"
+PROJECTS_DIR="$CLAUDE_DIR/projects"
 
-# Step 1: Sync files
-echo "  Syncing CLAUDE.md..."
-cp "$HOME/.claude/CLAUDE.md" "$CONFIG_DIR/CLAUDE.md" || echo "  WARN: CLAUDE.md sync failed"
-
-echo "  Syncing memory files..."
-cp "$MEMORY_SRC/"*.md "$CONFIG_DIR/memory/" 2>/dev/null || echo "  WARN: Memory sync failed"
-
-echo "  Syncing conversations..."
-cp -ru "$HOME/.claude/projects/" "$CONV_DIR/" 2>/dev/null || echo "  WARN: Conversation sync failed"
-
-# Step 2: Git commit and push
-cd "$CLAUDE_DIR"
-MSG="${1:-backup $(date '+%Y-%m-%d %H:%M')}"
-git add -A
-CHANGES=$(git diff --cached --stat)
-if [ -z "$CHANGES" ]; then
-    echo "  No changes to commit."
-    echo "=== Done $(date) ==="
-    exit 0
+if [ ! -d "$CLAUDE_DIR" ]; then
+    echo "ERROR: Claude Code config not found at $CLAUDE_DIR"
+    echo "Make sure Claude Code CLI is installed."
+    exit 1
 fi
-git commit -m "$MSG"
-timeout 60 git push || echo "  ERROR: git push failed or timed out"
 
-# Step 3: Backup all individual tool repos
+# Find the backup repo (look for _claude-config directory or .git in parent)
+BACKUP_REPO=""
+# Check if there's a _claude-config dir in common locations
+for candidate in "$HOME/Desktop/Claude" "$HOME/Documents/Claude" "$HOME/Projects/Claude" "$(dirname "$SCRIPT_DIR")"; do
+    if [ -d "$candidate/_claude-config" ] && [ -d "$candidate/.git" ]; then
+        BACKUP_REPO="$candidate"
+        break
+    fi
+done
+
+if [ -z "$BACKUP_REPO" ]; then
+    echo "WARN: No backup repo found (looking for _claude-config/ in a git repo)."
+    echo "Skipping main repo backup. Tool repos will still be backed up."
+else
+    echo "  Backup repo: $BACKUP_REPO"
+
+    CONFIG_DIR="$BACKUP_REPO/_claude-config"
+    CONV_DIR="$BACKUP_REPO/_conversations"
+    mkdir -p "$CONFIG_DIR/memory" "$CONV_DIR"
+
+    # Step 0: Generate digest
+    echo "  Running digest generation..."
+    bash "$SCRIPT_DIR/update-memory.sh" 2>&1 || echo "  WARN: Digest generation had issues"
+
+    # Step 1: Sync Claude config
+    echo "  Syncing CLAUDE.md..."
+    cp "$CLAUDE_DIR/CLAUDE.md" "$CONFIG_DIR/CLAUDE.md" 2>/dev/null || echo "  WARN: CLAUDE.md not found"
+
+    echo "  Syncing settings..."
+    cp "$CLAUDE_DIR/settings.json" "$CONFIG_DIR/settings.json" 2>/dev/null || true
+
+    # Sync memory files (find the project with a memory/ dir)
+    echo "  Syncing memory files..."
+    for memdir in "$PROJECTS_DIR"/*/memory/; do
+        if [ -d "$memdir" ]; then
+            cp "$memdir"*.md "$CONFIG_DIR/memory/" 2>/dev/null || true
+            echo "    Found memory at: $memdir"
+            break
+        fi
+    done
+
+    # Sync conversations
+    echo "  Syncing conversations..."
+    cp -ru "$PROJECTS_DIR/" "$CONV_DIR/" 2>/dev/null || echo "  WARN: Conversation sync failed"
+
+    # Step 2: Commit and push
+    cd "$BACKUP_REPO"
+    MSG="${1:-backup $(date '+%Y-%m-%d %H:%M')}"
+    git add -A
+    CHANGES=$(git diff --cached --stat 2>/dev/null)
+    if [ -z "$CHANGES" ]; then
+        echo "  No changes to commit."
+    else
+        git commit -m "$MSG" 2>&1 | tail -1
+        timeout 60 git push 2>&1 | tail -1 || echo "  ERROR: push failed"
+    fi
+fi
+
+# Step 3: Backup all tool repos (auto-discovers git repos)
 echo "  Backing up all tool repos..."
 bash "$SCRIPT_DIR/backup-all-tools.sh" 2>&1 || echo "  WARN: Tool backup had issues"
 

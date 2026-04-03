@@ -1,15 +1,12 @@
 """
-Memory Sync — Conversation Digest Generator
-Scans all Claude Code project conversations, extracts FULL user and assistant messages,
-outputs per-project digest files for comprehensive memory analysis.
+Memory Sync — Conversation Digest Generator (Portable)
+Scans all Claude Code project conversations, extracts full messages,
+outputs per-project digest files for memory analysis.
+
+Auto-detects Claude projects directory on any machine.
 
 Usage:
-    python memory-sync.py [--days 7] [--output-dir digests/] [--all]
-
-Modes:
-    --days N        Extract conversations from last N days (default: 7, for daily runs)
-    --all           Extract ALL conversations ever (full historical pass)
-    --output-dir    Directory for per-project digest files (default: _digests/)
+    python memory-sync.py [--days 1] [--output-dir digests/] [--all]
 """
 
 import json
@@ -21,34 +18,77 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
 
-CLAUDE_PROJECTS_DIR = Path(os.path.expanduser("~")) / ".claude" / "projects"
-
 # Pre-compiled regexes for performance
 RE_SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 RE_TASK_NOTIFICATION = re.compile(r"<task-notification>.*?</task-notification>", re.DOTALL)
 
 
+def find_claude_projects_dir() -> Path:
+    """Auto-detect Claude Code projects directory on any OS."""
+    home = Path.home()
+
+    # Standard location: ~/.claude/projects/
+    standard = home / ".claude" / "projects"
+    if standard.exists():
+        return standard
+
+    # Windows AppData fallback
+    appdata = Path(os.environ.get("APPDATA", "")) / "claude" / "projects"
+    if appdata.exists():
+        return appdata
+
+    # XDG fallback (Linux)
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "claude" / "projects"
+    if xdg.exists():
+        return xdg
+
+    print("ERROR: Could not find Claude Code projects directory.", file=sys.stderr)
+    print("Expected at: ~/.claude/projects/", file=sys.stderr)
+    print("Make sure Claude Code CLI is installed and has been used at least once.", file=sys.stderr)
+    sys.exit(1)
+
+
 def folder_to_project_name(folder_name: str) -> str:
-    """Convert Claude's folder naming convention back to readable names."""
-    name = folder_name.replace("C--Users-Gaming-PC-Desktop-Claude-", "")
-    name = name.replace("C--Users-Gaming-PC-Desktop-", "")
-    name = name.replace("C--Users-Gaming-PC-Downloads-", "Downloads/")
-    name = name.replace("C--Users-Gaming-PC", "Home")
-    name = name.replace("C--Users-GAMING-1-AppData-Local-Temp", "Temp")
-    name = name.replace("D--OneDrive---Universitatea--OVIDIUS--", "Uni/")
+    """Convert Claude's folder naming convention back to readable names.
+    Works on any machine — detects the username dynamically."""
+    name = folder_name
+
+    # Remove common path prefixes (platform-agnostic)
+    # Claude encodes paths as C--Users-USERNAME-... or /home-USERNAME-...
+    # Strip everything up to and including the username portion
+    patterns = [
+        r"^[A-Z]--Users-[^-]+-Desktop-",  # Windows: C--Users-Name-Desktop-
+        r"^[A-Z]--Users-[^-]+-Documents-",  # Windows: C--Users-Name-Documents-
+        r"^[A-Z]--Users-[^-]+-",  # Windows: C--Users-Name-
+        r"^[A-Z]--Users-[^-]+-[^-]+-",  # Windows with spaces: C--Users-GAMING-1-
+        r"^home-[^-]+-",  # Linux: home-username-
+        r"^Users-[^-]+-",  # macOS: Users-username-
+    ]
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", name)
+        if cleaned != name:
+            name = cleaned
+            break
+
+    # Handle drive letter prefixes that remain
+    name = re.sub(r"^[A-Z]--", "", name)
+
+    # Convert separators
     name = name.replace("--", "/").replace("-", " ")
-    return name if name else folder_name
+
+    return name.strip() if name.strip() else folder_name
 
 
 def folder_to_safe_filename(folder_name: str) -> str:
-    """Convert project folder name to a safe filename for the digest."""
+    """Convert project folder name to a safe filename."""
     name = folder_to_project_name(folder_name)
     safe = re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '-').lower()
     return safe or 'unknown'
 
 
 def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dict]:
-    """Parse a JSONL conversation file and extract ALL messages (optionally after cutoff)."""
+    """Parse a JSONL conversation file and extract ALL messages."""
     messages = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -61,7 +101,6 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
                 except json.JSONDecodeError:
                     continue
 
-                # Get timestamp
                 timestamp_str = entry.get("timestamp")
                 if not timestamp_str:
                     msg = entry.get("message", {})
@@ -117,7 +156,6 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
                 if not role or not content_text.strip():
                     continue
 
-                # Strip system reminders and task notifications (noise, not content)
                 content_text = RE_SYSTEM_REMINDER.sub("", content_text)
                 content_text = RE_TASK_NOTIFICATION.sub("[task notification]", content_text)
                 content_text = content_text.strip()
@@ -136,13 +174,6 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
     return messages
 
 
-def get_conversation_timestamp(messages: list[dict]) -> datetime | None:
-    """Get the most recent timestamp from a conversation."""
-    if not messages:
-        return None
-    return max(m["timestamp"] for m in messages)
-
-
 def build_project_digest(project_name: str, conversations: list[dict]) -> str:
     """Build a full digest for a single project — no truncation."""
     lines = []
@@ -154,7 +185,6 @@ def build_project_digest(project_name: str, conversations: list[dict]) -> str:
     lines.append(f"**Date range:** {earliest.strftime('%Y-%m-%d')} to {latest.strftime('%Y-%m-%d')}")
     lines.append("")
 
-    # Sort conversations chronologically (oldest first for narrative flow)
     conversations.sort(key=lambda c: c["earliest"])
 
     for i, conv in enumerate(conversations, 1):
@@ -178,25 +208,23 @@ def build_project_digest(project_name: str, conversations: list[dict]) -> str:
 
 def run(days: int | None, output_dir: str, extract_all: bool):
     """Main extraction logic."""
+    claude_projects = find_claude_projects_dir()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     cutoff = None
     if not extract_all:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days or 7)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days or 1)
         label = f"last {days} days"
     else:
         label = "ALL TIME"
 
+    print(f"Claude projects: {claude_projects}", file=sys.stderr)
     print(f"Scanning conversations ({label})...", file=sys.stderr)
-
-    if not CLAUDE_PROJECTS_DIR.exists():
-        print(f"ERROR: Claude projects directory not found at {CLAUDE_PROJECTS_DIR}", file=sys.stderr)
-        sys.exit(1)
 
     project_stats = []
 
-    for project_dir in sorted(CLAUDE_PROJECTS_DIR.iterdir()):
+    for project_dir in sorted(claude_projects.iterdir()):
         if not project_dir.is_dir():
             continue
 
@@ -204,13 +232,9 @@ def run(days: int | None, output_dir: str, extract_all: bool):
         safe_name = folder_to_safe_filename(project_dir.name)
         jsonl_files = list(project_dir.glob("*.jsonl"))
 
-        # Also check subdirectories for conversation files (subagents, etc.)
-        # but skip them — subagent conversations are internal, not user-facing
-
         conversations = []
 
         for jf in jsonl_files:
-            # If filtering by days, skip old files
             if cutoff:
                 try:
                     mtime = datetime.fromtimestamp(jf.stat().st_mtime, tz=timezone.utc)
@@ -234,7 +258,6 @@ def run(days: int | None, output_dir: str, extract_all: bool):
         if not conversations:
             continue
 
-        # Build full digest for this project
         digest = build_project_digest(project_name, conversations)
 
         digest_file = output_path / f"{safe_name}.md"
@@ -252,6 +275,10 @@ def run(days: int | None, output_dir: str, extract_all: bool):
         })
 
         print(f"  {project_name}: {len(conversations)} conversations, {total_messages} messages, {file_size_kb:.0f}KB", file=sys.stderr)
+
+    if not project_stats:
+        print(f"No conversations found ({label}).", file=sys.stderr)
+        return
 
     # Write manifest
     manifest_lines = []
@@ -284,9 +311,9 @@ def run(days: int | None, output_dir: str, extract_all: bool):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate conversation digests for memory sync")
-    parser.add_argument("--days", type=int, default=1, help="Look back N days (default: 1, for daily runs)")
-    parser.add_argument("--all", action="store_true", help="Extract ALL conversations (full historical pass)")
-    parser.add_argument("--output-dir", type=str, default=None, help="Output directory for digest files")
+    parser.add_argument("--days", type=int, default=1, help="Look back N days (default: 1)")
+    parser.add_argument("--all", action="store_true", help="Extract ALL conversations")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
     args = parser.parse_args()
 
     default_dir = Path(__file__).parent / "_digests"

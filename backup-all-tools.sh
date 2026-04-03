@@ -1,70 +1,80 @@
 #!/bin/bash
 set -uo pipefail
 
-# backup-all-tools.sh — Auto-backup all tool repos to GitHub
-# Cycles through every registered tool, commits changes, pushes.
-# Runs daily via Task Scheduler alongside the main backup.
+# backup-all-tools.sh — Auto-discover and backup all git repos to GitHub
+# Scans common directories for any folder with a .git directory and a remote,
+# then commits and pushes changes. No hardcoded paths — works on any machine.
 #
-# Usage: ./backup-all-tools.sh
+# Usage: ./backup-all-tools.sh [scan_dir1] [scan_dir2] ...
+#        Defaults to ~/Desktop and ~/Documents if no dirs specified.
 
-LOGFILE="$HOME/Desktop/Claude/_tools-backup.log"
+LOGFILE="$(dirname "$0")/_tools-backup.log"
 exec >> "$LOGFILE" 2>&1
 echo ""
 echo "=== Tools Backup — $(date) ==="
 
-# All tool repos: [directory]|[repo name]
-REPOS=(
-  "$HOME/Desktop/Claude/Finance|vocality-accounting"
-  "$HOME/Desktop/Claude/Systems/automations/11-preply-lead-messenger|preply-lead-messenger"
-  "$HOME/Desktop/Claude/Systems/automations/02-lead-gen-chatbot|vocality-chat-widget"
-  "$HOME/Desktop/Claude/Claude Codex|claude-codex"
-  "$HOME/Desktop/Claude/Skool|vocality-skool"
-  "$HOME/Desktop/Transcriptor v2|transcriptor-v2"
-  "$HOME/Desktop/Claude/UsageBOT|claude-code-usage-dashboard"
-  "$HOME/Desktop/Claude/Backup System|claude-backup-system"
-)
+# Directories to scan for git repos (override with arguments)
+if [ $# -gt 0 ]; then
+    SCAN_DIRS=("$@")
+else
+    SCAN_DIRS=(
+        "$HOME/Desktop"
+        "$HOME/Documents"
+        "$HOME/Projects"
+    )
+fi
 
 PUSHED=0
 SKIPPED=0
 FAILED=0
+FOUND=0
 
-for entry in "${REPOS[@]}"; do
-  DIR="${entry%%|*}"
-  NAME="${entry##*|}"
+for SCAN_DIR in "${SCAN_DIRS[@]}"; do
+    if [ ! -d "$SCAN_DIR" ]; then
+        continue
+    fi
 
-  if [ ! -d "$DIR/.git" ]; then
-    echo "  SKIP: $NAME — no .git directory at $DIR"
-    ((SKIPPED++))
-    continue
-  fi
+    echo "  Scanning: $SCAN_DIR"
 
-  cd "$DIR"
+    # Find all directories containing .git (max 3 levels deep to avoid deep nesting)
+    while IFS= read -r gitdir; do
+        REPO_DIR="$(dirname "$gitdir")"
+        REPO_NAME="$(basename "$REPO_DIR")"
+        ((FOUND++))
 
-  # Check for changes (staged, unstaged, or untracked)
-  CHANGES=$(git status --porcelain 2>/dev/null)
+        # Skip if no remote configured (local-only repos)
+        REMOTE=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)
+        if [ -z "$REMOTE" ]; then
+            echo "    SKIP: $REPO_NAME — no remote configured"
+            ((SKIPPED++))
+            continue
+        fi
 
-  if [ -z "$CHANGES" ]; then
-    echo "  OK: $NAME — no changes"
-    ((SKIPPED++))
-    continue
-  fi
+        # Check for changes
+        CHANGES=$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)
+        if [ -z "$CHANGES" ]; then
+            echo "    OK: $REPO_NAME — no changes"
+            ((SKIPPED++))
+            continue
+        fi
 
-  # Count what changed
-  CHANGE_COUNT=$(echo "$CHANGES" | wc -l | tr -d ' ')
-  echo "  PUSH: $NAME — $CHANGE_COUNT file(s) changed"
+        CHANGE_COUNT=$(echo "$CHANGES" | wc -l | tr -d ' ')
+        echo "    PUSH: $REPO_NAME — $CHANGE_COUNT file(s) changed"
 
-  # Stage, commit, push
-  git add -A
-  git commit -m "auto-backup $(date '+%Y-%m-%d %H:%M') — $CHANGE_COUNT file(s)" 2>&1 | tail -1
+        # Stage, commit, push
+        git -C "$REPO_DIR" add -A
+        git -C "$REPO_DIR" commit -m "auto-backup $(date '+%Y-%m-%d %H:%M') — $CHANGE_COUNT file(s)" 2>&1 | tail -1
 
-  if timeout 60 git push 2>&1 | tail -1; then
-    ((PUSHED++))
-  else
-    echo "  ERROR: $NAME — push failed"
-    ((FAILED++))
-  fi
+        if timeout 60 git -C "$REPO_DIR" push 2>&1 | tail -1; then
+            ((PUSHED++))
+        else
+            echo "    ERROR: $REPO_NAME — push failed"
+            ((FAILED++))
+        fi
+
+    done < <(find "$SCAN_DIR" -maxdepth 4 -name ".git" -type d 2>/dev/null | sort)
 done
 
 echo ""
-echo "SUMMARY: $PUSHED pushed, $SKIPPED unchanged, $FAILED failed"
+echo "SUMMARY: $FOUND repos found. $PUSHED pushed, $SKIPPED unchanged, $FAILED failed."
 echo "=== Done $(date) ==="
