@@ -11,6 +11,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$SCRIPT_DIR/_backup.log"
 
+# Auto-detect Python
+PYTHON=""
+for cmd in python3 python /c/Python314/python /c/Python312/python; do
+    if command -v "$cmd" &>/dev/null; then
+        PYTHON="$cmd"
+        break
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: Python not found. Install Python 3.10+ and add to PATH." >&2
+    exit 1
+fi
+
 STEPS_OK=0
 STEPS_WARN=0
 STEPS_FAIL=0
@@ -82,11 +96,11 @@ else
     log_warn "No memory directories found"
 fi
 
-# Sync conversations
-if cp -ru "$PROJECTS_DIR/" "$CONV_DIR/" 2>/dev/null; then
+# Sync conversations (incremental — only new/modified files)
+if $PYTHON "$SCRIPT_DIR/sync-conversations.py" "$PROJECTS_DIR" "$CONV_DIR"; then
     log_ok "Conversations synced"
 else
-    log_warn "Conversation sync failed"
+    log_warn "Conversation sync had errors"
 fi
 
 # Step 3: Commit and push
