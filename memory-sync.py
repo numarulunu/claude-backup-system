@@ -109,7 +109,12 @@ def extract_content_text(raw_content, include_tools: bool = False) -> str:
 
 
 def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dict]:
-    """Parse a JSONL conversation file and extract ALL messages."""
+    """Parse a JSONL conversation file and extract ALL messages.
+
+    Returns a list of message dicts. Each dict has keys:
+        role, text, timestamp, input_tokens, output_tokens
+    Token fields are 0 when not present in the source data.
+    """
     messages = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -158,16 +163,35 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
                 if not content_text or content_text == "[task notification]":
                     continue
 
+                # Extract token counts from usage field on assistant messages
+                input_tokens = 0
+                output_tokens = 0
+                usage = msg.get("usage") or entry.get("usage")
+                if isinstance(usage, dict):
+                    input_tokens = usage.get("input_tokens", 0) or 0
+                    output_tokens = usage.get("output_tokens", 0) or 0
+
                 messages.append({
                     "role": entry_type,
                     "text": content_text,
                     "timestamp": ts,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
                 })
 
     except (OSError, PermissionError) as e:
         print(f"  Warning: Could not read {filepath}: {e}", file=sys.stderr)
 
     return messages
+
+
+def _format_token_count(tokens: int) -> str:
+    """Format a token count as a human-readable string (e.g. '12.3k')."""
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    if tokens >= 1_000:
+        return f"{tokens / 1_000:.1f}k"
+    return str(tokens)
 
 
 def build_project_digest(project_name: str, conversations: list[dict]) -> str:
@@ -179,6 +203,14 @@ def build_project_digest(project_name: str, conversations: list[dict]) -> str:
     earliest = min(c["earliest"] for c in conversations)
     latest = max(c["latest"] for c in conversations)
     lines.append(f"**Date range:** {earliest.strftime('%Y-%m-%d')} to {latest.strftime('%Y-%m-%d')}")
+
+    # Project-level token totals
+    total_input = sum(m.get("input_tokens", 0) for c in conversations for m in c["messages"])
+    total_output = sum(m.get("output_tokens", 0) for c in conversations for m in c["messages"])
+    total_tokens = total_input + total_output
+    if total_tokens > 0:
+        lines.append(f"**Tokens:** {_format_token_count(total_tokens)} total ({_format_token_count(total_input)} in, {_format_token_count(total_output)} out)")
+
     lines.append("")
 
     conversations.sort(key=lambda c: c["earliest"])
@@ -188,9 +220,17 @@ def build_project_digest(project_name: str, conversations: list[dict]) -> str:
         end = conv["latest"].strftime("%Y-%m-%d %H:%M UTC")
         msg_count = len(conv["messages"])
 
+        # Per-session token counts
+        session_input = sum(m.get("input_tokens", 0) for m in conv["messages"])
+        session_output = sum(m.get("output_tokens", 0) for m in conv["messages"])
+        session_total = session_input + session_output
+
         lines.append(f"---")
         lines.append(f"## Session {i} — {start}")
-        lines.append(f"*{msg_count} messages, ended {end}*\n")
+        if session_total > 0:
+            lines.append(f"*{msg_count} messages, ended {end}, tokens: {_format_token_count(session_total)} ({_format_token_count(session_input)} in, {_format_token_count(session_output)} out)*\n")
+        else:
+            lines.append(f"*{msg_count} messages, ended {end}*\n")
 
         for msg in conv["messages"]:
             ts = msg["timestamp"].strftime("%H:%M")
@@ -236,6 +276,20 @@ def write_pending_flag(output_path: Path):
     pending_path.write_text(datetime.now().strftime('%Y-%m-%d %H:%M'), encoding="utf-8")
 
 
+def get_max_jsonl_mtime(project_dir: Path) -> float:
+    """Return the latest mtime among all JSONL files in a project directory.
+    Returns 0.0 if no JSONL files exist."""
+    max_mtime = 0.0
+    for jf in project_dir.glob("*.jsonl"):
+        try:
+            mt = jf.stat().st_mtime
+            if mt > max_mtime:
+                max_mtime = mt
+        except OSError:
+            continue
+    return max_mtime
+
+
 def extract_project(project_dir: Path, cutoff: datetime | None) -> tuple[str, str, list]:
     """Extract conversations from a single project directory."""
     project_name = folder_to_project_name(project_dir.name)
@@ -267,7 +321,28 @@ def extract_project(project_dir: Path, cutoff: datetime | None) -> tuple[str, st
     return project_name, safe_name, conversations
 
 
-def run(days: int | None, output_dir: str, extract_all: bool, max_size_mb: float = DEFAULT_MAX_SIZE_MB):
+def _last_sync_path(output_path: Path, safe_name: str) -> Path:
+    """Return the path to the .last_sync timestamp file for a project."""
+    return output_path / f".last_sync_{safe_name}"
+
+
+def _read_last_sync(output_path: Path, safe_name: str) -> float:
+    """Read the stored mtime from a .last_sync file. Returns 0.0 if missing."""
+    p = _last_sync_path(output_path, safe_name)
+    try:
+        return float(p.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _write_last_sync(output_path: Path, safe_name: str, mtime: float):
+    """Write the latest JSONL mtime to the .last_sync file."""
+    p = _last_sync_path(output_path, safe_name)
+    p.write_text(str(mtime), encoding="utf-8")
+
+
+def run(days: int | None, output_dir: str, extract_all: bool,
+        max_size_mb: float = DEFAULT_MAX_SIZE_MB, force: bool = False):
     """Main extraction logic."""
     claude_projects = find_claude_projects_dir()
     output_path = Path(output_dir)
@@ -286,10 +361,20 @@ def run(days: int | None, output_dir: str, extract_all: bool, max_size_mb: float
     print(f"Scanning conversations ({label}, max {max_size_mb}MB per digest)...", file=sys.stderr)
 
     project_stats = []
+    skipped_count = 0
 
     for project_dir in sorted(claude_projects.iterdir()):
         if not project_dir.is_dir():
             continue
+
+        # Deduplication: skip projects whose JSONL files haven't changed
+        safe_name_check = folder_to_safe_filename(project_dir.name)
+        if not force:
+            current_mtime = get_max_jsonl_mtime(project_dir)
+            last_sync_mtime = _read_last_sync(output_path, safe_name_check)
+            if current_mtime > 0 and current_mtime <= last_sync_mtime:
+                skipped_count += 1
+                continue
 
         project_name, safe_name, conversations = extract_project(project_dir, cutoff)
 
@@ -326,6 +411,11 @@ def run(days: int | None, output_dir: str, extract_all: bool, max_size_mb: float
         digest_file = output_path / f"{safe_name}.md"
         digest_file.write_text(digest, encoding="utf-8")
 
+        # Record the latest JSONL mtime so we can skip this project next time
+        current_mtime = get_max_jsonl_mtime(project_dir)
+        if current_mtime > 0:
+            _write_last_sync(output_path, safe_name, current_mtime)
+
         total_messages = sum(len(c["messages"]) for c in conversations)
         file_size_kb = digest_bytes / 1024
 
@@ -339,8 +429,12 @@ def run(days: int | None, output_dir: str, extract_all: bool, max_size_mb: float
 
         print(f"  {project_name}: {len(conversations)} conversations, {total_messages} messages, {file_size_kb:.0f}KB", file=sys.stderr)
 
+    if skipped_count > 0:
+        print(f"  Skipped {skipped_count} unchanged project(s)", file=sys.stderr)
+
     if not project_stats:
-        print(f"No conversations found ({label}).", file=sys.stderr)
+        if skipped_count == 0:
+            print(f"No conversations found ({label}).", file=sys.stderr)
         return
 
     manifest_path, total_msgs, total_size = write_manifest(output_path, project_stats, label)
@@ -358,12 +452,15 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
     parser.add_argument("--max-size", type=float, default=DEFAULT_MAX_SIZE_MB,
                        help=f"Max digest file size in MB (default: {DEFAULT_MAX_SIZE_MB})")
+    parser.add_argument("--force", action="store_true",
+                       help="Ignore deduplication timestamps and rebuild all digests")
     args = parser.parse_args()
 
     default_dir = Path(__file__).parent / "_digests"
     output_dir = args.output_dir or str(default_dir)
 
-    run(days=args.days, output_dir=output_dir, extract_all=args.all, max_size_mb=args.max_size)
+    run(days=args.days, output_dir=output_dir, extract_all=args.all,
+        max_size_mb=args.max_size, force=args.force)
 
 
 if __name__ == "__main__":

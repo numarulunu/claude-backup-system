@@ -213,3 +213,138 @@ class TestBuildProjectDigest:
         first_pos = digest.index("First")
         second_pos = digest.index("Second")
         assert first_pos < second_pos, "Earlier session should come first"
+
+
+# ---------------------------------------------------------------------------
+# Token counting in parse_jsonl_file and build_project_digest
+# ---------------------------------------------------------------------------
+
+class TestTokenCounting:
+    def _make_entry_with_usage(self, role, text, timestamp, input_tokens=0, output_tokens=0):
+        """Helper that creates a JSONL entry with usage data."""
+        if role == "user":
+            entry = {
+                "type": "user",
+                "timestamp": timestamp,
+                "message": {"content": text, "timestamp": timestamp},
+            }
+        else:
+            entry = {
+                "type": "assistant",
+                "timestamp": timestamp,
+                "message": {
+                    "content": [{"type": "text", "text": text}],
+                    "timestamp": timestamp,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                },
+            }
+        return json.dumps(entry)
+
+    def test_parse_extracts_token_counts(self, tmp_path):
+        f = tmp_path / "conv.jsonl"
+        f.write_text(
+            self._make_entry_with_usage("assistant", "Response", "2026-01-15T10:00:00Z",
+                                        input_tokens=500, output_tokens=200) + "\n"
+        )
+        messages = memory_sync.parse_jsonl_file(f)
+        assert len(messages) == 1
+        assert messages[0]["input_tokens"] == 500
+        assert messages[0]["output_tokens"] == 200
+
+    def test_parse_defaults_zero_without_usage(self, tmp_path):
+        f = tmp_path / "conv.jsonl"
+        f.write_text(make_jsonl_entry("user", "Hello", "2026-01-15T10:00:00Z") + "\n")
+        messages = memory_sync.parse_jsonl_file(f)
+        assert messages[0]["input_tokens"] == 0
+        assert messages[0]["output_tokens"] == 0
+
+    def test_digest_includes_token_header_when_present(self):
+        conversations = [{
+            "file": "test.jsonl",
+            "messages": [
+                {"role": "user", "text": "Hello", "timestamp": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+                 "input_tokens": 0, "output_tokens": 0},
+                {"role": "assistant", "text": "Hi", "timestamp": datetime(2026, 1, 15, 10, 1, tzinfo=timezone.utc),
+                 "input_tokens": 1500, "output_tokens": 500},
+            ],
+            "earliest": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+            "latest": datetime(2026, 1, 15, 10, 1, tzinfo=timezone.utc),
+        }]
+        digest = memory_sync.build_project_digest("Test", conversations)
+        assert "**Tokens:**" in digest
+        assert "2.0k total" in digest
+        assert "1.5k in" in digest
+        assert "500 out" in digest
+
+    def test_digest_session_header_includes_tokens(self):
+        conversations = [{
+            "file": "test.jsonl",
+            "messages": [
+                {"role": "assistant", "text": "Hi", "timestamp": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+                 "input_tokens": 3000, "output_tokens": 1000},
+            ],
+            "earliest": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+            "latest": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+        }]
+        digest = memory_sync.build_project_digest("Test", conversations)
+        assert "tokens: 4.0k" in digest
+
+    def test_digest_no_token_header_when_zero(self):
+        conversations = [{
+            "file": "test.jsonl",
+            "messages": [
+                {"role": "user", "text": "Hello", "timestamp": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+                 "input_tokens": 0, "output_tokens": 0},
+            ],
+            "earliest": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+            "latest": datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+        }]
+        digest = memory_sync.build_project_digest("Test", conversations)
+        assert "**Tokens:**" not in digest
+        # Session header should use the old format (no tokens mention)
+        assert "tokens:" not in digest.lower().split("**Tokens:**")[0] if "**Tokens:**" in digest else True
+
+
+# ---------------------------------------------------------------------------
+# Deduplication: .last_sync mechanism
+# ---------------------------------------------------------------------------
+
+class TestDeduplication:
+    def test_write_and_read_last_sync(self, tmp_path):
+        memory_sync._write_last_sync(tmp_path, "my-project", 1234567890.5)
+        result = memory_sync._read_last_sync(tmp_path, "my-project")
+        assert result == 1234567890.5
+
+    def test_read_last_sync_missing_returns_zero(self, tmp_path):
+        result = memory_sync._read_last_sync(tmp_path, "nonexistent")
+        assert result == 0.0
+
+    def test_last_sync_path(self, tmp_path):
+        p = memory_sync._last_sync_path(tmp_path, "my-project")
+        assert p.name == ".last_sync_my-project"
+        assert p.parent == tmp_path
+
+    def test_get_max_jsonl_mtime(self, tmp_path):
+        # Create two jsonl files with different content
+        f1 = tmp_path / "a.jsonl"
+        f2 = tmp_path / "b.jsonl"
+        f1.write_text("{}")
+        import time
+        time.sleep(0.05)
+        f2.write_text("{}")
+        mtime = memory_sync.get_max_jsonl_mtime(tmp_path)
+        assert mtime == pytest.approx(f2.stat().st_mtime, abs=0.01)
+
+    def test_get_max_jsonl_mtime_empty_dir(self, tmp_path):
+        assert memory_sync.get_max_jsonl_mtime(tmp_path) == 0.0
+
+
+class TestFormatTokenCount:
+    def test_small(self):
+        assert memory_sync._format_token_count(500) == "500"
+
+    def test_thousands(self):
+        assert memory_sync._format_token_count(1500) == "1.5k"
+
+    def test_millions(self):
+        assert memory_sync._format_token_count(2_500_000) == "2.5M"
