@@ -1,4 +1,5 @@
 #!/bin/bash
+export PATH="/usr/bin:/bin:/c/Program Files/Git/usr/bin:/c/Program Files/Git/bin:/c/Program Files/Git/mingw64/bin:/mingw64/bin:${PATH:-}"
 set -euo pipefail
 
 # update-memory.sh — Conversation Digest Generator (portable)

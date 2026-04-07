@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Ensure core utils are on PATH BEFORE set -e (Windows Task Scheduler may invoke with empty PATH)
+export PATH="/usr/bin:/bin:/c/Program Files/Git/usr/bin:/c/Program Files/Git/bin:/c/Program Files/Git/mingw64/bin:/mingw64/bin:${PATH:-}"
+
 set -euo pipefail
 
 # backup.sh — Daily backup for Claude Code config, conversations, and memory.
