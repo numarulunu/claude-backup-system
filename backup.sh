@@ -100,6 +100,15 @@ else
     log_warn "No memory directories found"
 fi
 
+# Sync Kontext database
+KONTEXT_DB="$HOME/Desktop/Claude/Kontext/kontext.db"
+if [ -f "$KONTEXT_DB" ]; then
+    cp "$KONTEXT_DB" "$CONFIG_DIR/kontext.db"
+    log_ok "kontext.db backed up"
+else
+    log_warn "kontext.db not found at $KONTEXT_DB"
+fi
+
 # Sync conversations (incremental — only new/modified files)
 if $PYTHON "$SCRIPT_DIR/sync-conversations.py" "$PROJECTS_DIR" "$CONV_DIR"; then
     log_ok "Conversations synced"
