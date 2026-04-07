@@ -55,9 +55,13 @@ flowchart TD
 | Source | Destination | Description |
 |---|---|---|
 | `~/.claude/projects/*.jsonl` | `_digests/*.md` | Conversation logs parsed into readable markdown, one file per project |
+| `~/.claude/projects/**/*.jsonl` | `_conversations/` | Raw JSONL archive (incremental, append-only) |
 | `~/.claude/CLAUDE.md` | `_claude-config/CLAUDE.md` | Global Claude Code instructions |
 | `~/.claude/settings.json` | `_claude-config/settings.json` | Claude Code settings |
 | `~/.claude/projects/*/memory/*.md` | `_claude-config/memory/` | All project memory files |
+| `~/Desktop/Claude/Kontext/kontext.db` | `_claude-config/kontext.db` | Kontext memory database (SQLite online backup) |
+
+> **Security:** Memory files, `kontext.db`, and `settings.json` may contain personal data and internal paths. **Ensure your backup repo is PRIVATE** before running.
 
 ---
 
@@ -139,6 +143,9 @@ Register-ScheduledTask -TaskName 'Claude Daily Backup' `
 | `backup.sh` | Main entry point -- digest, sync config, commit, push |
 | `update-memory.sh` | Runs digest generation only |
 | `memory-sync.py` | Parses JSONL conversation logs into per-project markdown digests |
+| `sync-conversations.py` | Incremental raw JSONL archive copier (append-only) |
+| `_detect-python.sh` | Shared Python interpreter detection (sourced by both shell scripts) |
+| `_log-rotate.sh` | Shared log rotation helper |
 | `tests/` | pytest tests for the digest logic |
 
 ---

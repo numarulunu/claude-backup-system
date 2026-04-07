@@ -85,6 +85,21 @@ class TestSync:
 
         assert result is False
 
+    def test_skips_non_jsonl_files(self, tmp_path):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        (src / "proj").mkdir(parents=True)
+        dst.mkdir()
+        (src / "proj" / "conv.jsonl").write_text("data\n")
+        (src / "proj" / "secrets.env").write_text("API_KEY=abc\n")
+        (src / "proj" / "cache.db").write_text("binary\n")
+
+        sync_mod.sync(str(src), str(dst))
+
+        assert (dst / "proj" / "conv.jsonl").exists()
+        assert not (dst / "proj" / "secrets.env").exists()
+        assert not (dst / "proj" / "cache.db").exists()
+
     def test_empty_source(self, tmp_path, capsys):
         src = tmp_path / "src"
         dst = tmp_path / "dst"

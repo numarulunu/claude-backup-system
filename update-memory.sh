@@ -14,32 +14,30 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DIGEST_DIR="$SCRIPT_DIR/_digests"
 LOGFILE="$SCRIPT_DIR/_memory-sync.log"
 
-# Auto-detect Python
-PYTHON=""
-for cmd in python3 python /c/Python314/python /c/Python312/python; do
-    if command -v "$cmd" &>/dev/null; then
-        PYTHON="$cmd"
-        break
-    fi
-done
+# shellcheck source=_detect-python.sh
+source "$SCRIPT_DIR/_detect-python.sh"
+# shellcheck source=_log-rotate.sh
+source "$SCRIPT_DIR/_log-rotate.sh"
 
-if [ -z "$PYTHON" ]; then
-    echo "ERROR: Python not found. Install Python 3.10+ and add to PATH." >&2
-    exit 1
-fi
+rotate_log "$LOGFILE"
 
 exec >> "$LOGFILE" 2>&1
 echo "=== Memory Digest Generator — $(date) ==="
 echo "  Python: $PYTHON ($($PYTHON --version 2>&1))"
 
-if [ "${1:-}" = "--all" ] 2>/dev/null; then
+if [ "${1:-}" = "--all" ]; then
     echo "  Running FULL historical extraction..."
     if ! $PYTHON "$SCRIPT_DIR/memory-sync.py" --all --output-dir "$DIGEST_DIR"; then
         echo "ERROR: Digest generation failed."
         exit 1
     fi
 else
-    DAYS=${1:-1}
+    DAYS="${1:-1}"
+    # Validate DAYS is a positive integer
+    if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: DAYS must be a positive integer, got: $DAYS" >&2
+        exit 1
+    fi
     echo "  Scanning last $DAYS day(s)..."
     if ! $PYTHON "$SCRIPT_DIR/memory-sync.py" --days "$DAYS" --output-dir "$DIGEST_DIR"; then
         echo "ERROR: Digest generation failed."

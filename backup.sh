@@ -14,28 +14,39 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$SCRIPT_DIR/_backup.log"
+LOCKFILE="$SCRIPT_DIR/.backup.lock"
 
-# Auto-detect Python
-PYTHON=""
-for cmd in python3 python /c/Python314/python /c/Python312/python; do
-    if command -v "$cmd" &>/dev/null; then
-        PYTHON="$cmd"
-        break
-    fi
-done
-
-if [ -z "$PYTHON" ]; then
-    echo "ERROR: Python not found. Install Python 3.10+ and add to PATH." >&2
-    exit 1
+# Concurrency guard — abort if another run is in progress
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "backup.sh: another run is in progress, exiting" >&2
+    exit 0
 fi
+
+# Shared helpers
+# shellcheck source=_detect-python.sh
+source "$SCRIPT_DIR/_detect-python.sh"
+# shellcheck source=_log-rotate.sh
+source "$SCRIPT_DIR/_log-rotate.sh"
+
+rotate_log "$LOGFILE"
 
 STEPS_OK=0
 STEPS_WARN=0
 STEPS_FAIL=0
 
-log_ok()   { echo "  OK: $1"; ((STEPS_OK++)); }
-log_warn() { echo "  WARN: $1"; ((STEPS_WARN++)); }
-log_fail() { echo "  FAIL: $1"; ((STEPS_FAIL++)); }
+log_ok()   { echo "  OK: $1";   STEPS_OK=$((STEPS_OK + 1));   }
+log_warn() { echo "  WARN: $1"; STEPS_WARN=$((STEPS_WARN + 1)); }
+log_fail() { echo "  FAIL: $1"; STEPS_FAIL=$((STEPS_FAIL + 1)); }
+
+# Atomic write to a file (truncate via tmp + rename).
+atomic_write() {
+    local path="$1"
+    local content="$2"
+    local tmp="${path}.tmp.$$"
+    printf '%s' "$content" > "$tmp"
+    mv -f "$tmp" "$path"
+}
 
 exec >> "$LOGFILE" 2>&1
 echo "=== Backup — $(date) ==="
@@ -63,7 +74,7 @@ if [ -z "$BACKUP_REPO" ]; then
     exit 1
 fi
 
-echo "  Backup repo: $BACKUP_REPO"
+echo "  Backup repo: ${BACKUP_REPO/#$HOME/~}"
 
 CONFIG_DIR="$BACKUP_REPO/_claude-config"
 CONV_DIR="$BACKUP_REPO/_conversations"
@@ -71,7 +82,7 @@ mkdir -p "$CONFIG_DIR/memory" "$CONV_DIR"
 
 # Step 1: Generate digest
 echo "  Running digest generation..."
-if bash "$SCRIPT_DIR/update-memory.sh" 2>&1; then
+if bash "$SCRIPT_DIR/update-memory.sh"; then
     log_ok "Digest generation"
 else
     log_warn "Digest generation had issues"
@@ -86,49 +97,70 @@ fi
 
 cp "$CLAUDE_DIR/settings.json" "$CONFIG_DIR/settings.json" 2>/dev/null || true
 
-# Sync memory files (all projects that have a memory/ dir)
-MEMORY_FOUND=0
-for memdir in "$PROJECTS_DIR"/*/memory/; do
-    if [ -d "$memdir" ]; then
-        cp "$memdir"*.md "$CONFIG_DIR/memory/" 2>/dev/null || true
-        ((MEMORY_FOUND++))
-    fi
-done
-if [ "$MEMORY_FOUND" -gt 0 ]; then
-    log_ok "Memory synced from $MEMORY_FOUND project(s)"
+# Sync memory files (all projects that have a memory/ dir).
+# Single find call instead of per-project cp subprocess.
+MEMORY_COUNT=$(find "$PROJECTS_DIR" -mindepth 3 -maxdepth 3 -type f -name '*.md' -path '*/memory/*' \
+    -exec cp {} "$CONFIG_DIR/memory/" \; -print 2>/dev/null | wc -l)
+if [ "$MEMORY_COUNT" -gt 0 ]; then
+    log_ok "Memory synced ($MEMORY_COUNT file(s))"
 else
-    log_warn "No memory directories found"
+    log_warn "No memory files found"
 fi
 
-# Sync Kontext database
-KONTEXT_DB="$HOME/Desktop/Claude/Kontext/kontext.db"
+# Sync Kontext database (SQLite online backup API — WAL-safe)
+KONTEXT_DB="${KONTEXT_DB:-$HOME/Desktop/Claude/Kontext/kontext.db}"
 if [ -f "$KONTEXT_DB" ]; then
-    cp "$KONTEXT_DB" "$CONFIG_DIR/kontext.db"
-    log_ok "kontext.db backed up"
+    if command -v sqlite3 &>/dev/null; then
+        if sqlite3 "$KONTEXT_DB" ".backup '$CONFIG_DIR/kontext.db.tmp'" 2>/dev/null \
+            && mv -f "$CONFIG_DIR/kontext.db.tmp" "$CONFIG_DIR/kontext.db"; then
+            log_ok "kontext.db backed up (online backup API)"
+        else
+            rm -f "$CONFIG_DIR/kontext.db.tmp"
+            log_warn "sqlite3 .backup failed for kontext.db"
+        fi
+    else
+        # Fallback: plain cp. WAL may be inconsistent but better than nothing.
+        cp "$KONTEXT_DB" "$CONFIG_DIR/kontext.db"
+        log_warn "kontext.db copied via cp (sqlite3 CLI not found — WAL may be inconsistent)"
+    fi
 else
-    log_warn "kontext.db not found at $KONTEXT_DB"
+    log_warn "kontext.db not found at ${KONTEXT_DB/#$HOME/~}"
 fi
 
 # Sync conversations (incremental — only new/modified files)
 if $PYTHON "$SCRIPT_DIR/sync-conversations.py" "$PROJECTS_DIR" "$CONV_DIR"; then
     log_ok "Conversations synced"
 else
-    log_warn "Conversation sync had errors"
+    log_warn "Conversation sync had errors (see log)"
 fi
 
 # Step 3: Commit and push
 cd "$BACKUP_REPO"
-MSG="${1:-backup $(date '+%Y-%m-%d %H:%M')}"
-git add -A
+# Sanitize commit message: strip shell metacharacters.
+RAW_MSG="${1:-backup $(date '+%Y-%m-%d %H:%M')}"
+MSG="${RAW_MSG//[\`\$\\]/}"
+
+# Explicit allow-list add — prevents blast-radius from future new file types.
+git add -- _claude-config _conversations 2>/dev/null || true
+
 CHANGES=$(git diff --cached --stat 2>/dev/null)
 if [ -z "$CHANGES" ]; then
     log_ok "No changes to commit"
 else
-    git commit -m "$MSG" 2>&1 | tail -1
-    if timeout 60 git push 2>&1 | tail -1; then
-        log_ok "Pushed to remote"
+    COMMIT_OUT=$(git commit -m "$MSG" 2>&1) || COMMIT_RC=$?
+    COMMIT_RC=${COMMIT_RC:-0}
+    echo "$COMMIT_OUT" | tail -1
+    if [ "$COMMIT_RC" -ne 0 ]; then
+        log_fail "git commit failed (rc=$COMMIT_RC)"
     else
-        log_fail "Push failed"
+        PUSH_OUT=$(timeout 60 git push 2>&1) || PUSH_RC=$?
+        PUSH_RC=${PUSH_RC:-0}
+        echo "$PUSH_OUT" | tail -1
+        if [ "$PUSH_RC" -eq 0 ]; then
+            log_ok "Pushed to remote"
+        else
+            log_fail "Push failed (rc=$PUSH_RC)"
+        fi
     fi
 fi
 
@@ -136,12 +168,20 @@ fi
 echo ""
 echo "SUMMARY: $STEPS_OK ok, $STEPS_WARN warnings, $STEPS_FAIL failures."
 
+# Warnings over threshold → soft-fail (exit 2).
+# Hard failures → exit 1.
+WARN_THRESHOLD=2
+FAIL_FLAG="$SCRIPT_DIR/_backup-failed"
+
 if [ "$STEPS_FAIL" -gt 0 ]; then
-    # Write failure flag for SessionStart hook to detect
-    echo "$(date '+%Y-%m-%d %H:%M') — $STEPS_FAIL failure(s)" > "$SCRIPT_DIR/_backup-failed"
+    atomic_write "$FAIL_FLAG" "$(date '+%Y-%m-%d %H:%M') — $STEPS_FAIL failure(s)"
     echo "=== Done with FAILURES $(date) ==="
     exit 1
+elif [ "$STEPS_WARN" -gt "$WARN_THRESHOLD" ]; then
+    atomic_write "$FAIL_FLAG" "$(date '+%Y-%m-%d %H:%M') — $STEPS_WARN warning(s) exceeded threshold"
+    echo "=== Done with WARNINGS $(date) ==="
+    exit 2
 else
-    rm -f "$SCRIPT_DIR/_backup-failed"
+    rm -f "$FAIL_FLAG"
     echo "=== Done $(date) ==="
 fi

@@ -21,6 +21,30 @@ from pathlib import Path
 RE_SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 RE_TASK_NOTIFICATION = re.compile(r"<task-notification>.*?</task-notification>", re.DOTALL)
 
+# Secret scrubbing patterns — applied to every message before it lands in a digest.
+SECRET_PATTERNS = [
+    (re.compile(r"sk-[A-Za-z0-9_\-]{20,}"), "sk-[REDACTED]"),
+    (re.compile(r"Bearer\s+[A-Za-z0-9+/=_\-\.]{20,}"), "Bearer [REDACTED]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_[REDACTED]"),
+    (re.compile(r"gho_[A-Za-z0-9]{20,}"), "gho_[REDACTED]"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{20,}"), "xox-[REDACTED]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA[REDACTED]"),
+]
+
+
+def scrub_secrets(text: str) -> str:
+    """Redact common secret patterns before writing to digest."""
+    for pat, repl in SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Write text to path atomically via tmp + rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
 
 def find_claude_projects_dir() -> Path:
     """Auto-detect Claude Code projects directory on any OS."""
@@ -117,7 +141,7 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
     """
     messages = []
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, "r", encoding="utf-8", errors="backslashreplace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -159,6 +183,7 @@ def parse_jsonl_file(filepath: Path, cutoff: datetime | None = None) -> list[dic
 
                 content_text = RE_SYSTEM_REMINDER.sub("", content_text)
                 content_text = RE_TASK_NOTIFICATION.sub("[task notification]", content_text)
+                content_text = scrub_secrets(content_text)
                 content_text = content_text.strip()
                 if not content_text or content_text == "[task notification]":
                     continue
@@ -266,14 +291,17 @@ def write_manifest(output_path: Path, project_stats: list, label: str):
         lines.append(f"| {p['name']} | `{Path(p['file']).name}` | {p['conversations']} | {p['messages']} | {p['size_kb']:.0f}KB |")
 
     manifest_path = output_path / "_manifest.md"
-    manifest_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(manifest_path, "\n".join(lines))
     return manifest_path, total_msgs, total_size
 
 
 def write_pending_flag(output_path: Path):
     """Write the digest-pending flag for SessionStart hook."""
     pending_path = output_path.parent / "_digest-pending"
-    pending_path.write_text(datetime.now().strftime('%Y-%m-%d %H:%M'), encoding="utf-8")
+    atomic_write_text(
+        pending_path,
+        datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+    )
 
 
 def get_max_jsonl_mtime(project_dir: Path) -> float:
@@ -290,21 +318,29 @@ def get_max_jsonl_mtime(project_dir: Path) -> float:
     return max_mtime
 
 
-def extract_project(project_dir: Path, cutoff: datetime | None) -> tuple[str, str, list]:
-    """Extract conversations from a single project directory."""
+def extract_project(project_dir: Path, cutoff: datetime | None) -> tuple[str, str, list, float]:
+    """Extract conversations from a single project directory.
+
+    Returns (project_name, safe_name, conversations, max_mtime). The max_mtime
+    is sampled once while walking the JSONL files so callers never need a
+    second traversal.
+
+    Note: No file-mtime pre-filter is applied. parse_jsonl_file already
+    applies the per-message cutoff, and the file-level filter can produce
+    false negatives if a file's OS mtime is stale (e.g. restored from backup).
+    """
     project_name = folder_to_project_name(project_dir.name)
     safe_name = folder_to_safe_filename(project_dir.name)
-    jsonl_files = list(project_dir.glob("*.jsonl"))
     conversations = []
+    max_mtime = 0.0
 
-    for jf in jsonl_files:
-        if cutoff:
-            try:
-                mtime = datetime.fromtimestamp(jf.stat().st_mtime, tz=timezone.utc)
-                if mtime < cutoff:
-                    continue
-            except OSError:
-                continue
+    for jf in project_dir.glob("*.jsonl"):
+        try:
+            mt = jf.stat().st_mtime
+            if mt > max_mtime:
+                max_mtime = mt
+        except OSError:
+            continue
 
         messages = parse_jsonl_file(jf, cutoff)
         if not messages:
@@ -318,7 +354,7 @@ def extract_project(project_dir: Path, cutoff: datetime | None) -> tuple[str, st
             "latest": max(m["timestamp"] for m in messages),
         })
 
-    return project_name, safe_name, conversations
+    return project_name, safe_name, conversations, max_mtime
 
 
 def _last_sync_path(output_path: Path, safe_name: str) -> Path:
@@ -336,9 +372,63 @@ def _read_last_sync(output_path: Path, safe_name: str) -> float:
 
 
 def _write_last_sync(output_path: Path, safe_name: str, mtime: float):
-    """Write the latest JSONL mtime to the .last_sync file."""
+    """Write the latest JSONL mtime to the .last_sync file (atomic)."""
     p = _last_sync_path(output_path, safe_name)
-    p.write_text(str(mtime), encoding="utf-8")
+    atomic_write_text(p, str(mtime))
+
+
+def _should_skip_project(project_dir: Path, output_path: Path, safe_name: str, force: bool) -> tuple[bool, float]:
+    """Decide whether to skip a project based on .last_sync vs current JSONL mtime.
+
+    Returns (skip, current_mtime). Uses strict `<` so a new file with an
+    mtime exactly equal to the previously stored value is NOT silently skipped.
+    """
+    if force:
+        return (False, 0.0)
+    current_mtime = get_max_jsonl_mtime(project_dir)
+    last_sync_mtime = _read_last_sync(output_path, safe_name)
+    # Strict `<=`: skip when the recorded mtime is at least as new as the current max.
+    # Note: if a new file appears with mtime exactly equal to the stored value
+    # (clock-tick collision, restored backup with preserved mtime), it will be
+    # missed. Run with --force to recover.
+    if current_mtime > 0 and current_mtime <= last_sync_mtime:
+        return (True, current_mtime)
+    return (False, current_mtime)
+
+
+def _trim_to_size(project_name: str, conversations: list, max_size_bytes: int) -> tuple[list, int, str | None]:
+    """Drop oldest sessions until digest fits under max_size_bytes.
+
+    Returns (kept, dropped_count, earliest_dropped_date). Measures each
+    session's serialized size exactly once — no O(n²) rebuilds.
+    """
+    if len(conversations) <= 1:
+        return (conversations, 0, None)
+
+    # Sort newest-first so we keep the most recent sessions.
+    conversations_sorted = sorted(conversations, key=lambda c: c["latest"], reverse=True)
+
+    # Measure each session's byte cost once.
+    sizes = [
+        len(build_project_digest(project_name, [c]).encode("utf-8"))
+        for c in conversations_sorted
+    ]
+
+    kept = []
+    running = 0
+    for c, sz in zip(conversations_sorted, sizes):
+        if running + sz > max_size_bytes and kept:
+            break
+        kept.append(c)
+        running += sz
+
+    dropped = conversations_sorted[len(kept):]
+    if not dropped:
+        return (conversations, 0, None)
+
+    earliest_dropped = min(d["earliest"] for d in dropped).strftime("%Y-%m-%d")
+    kept.reverse()  # Back to chronological order for the digest
+    return (kept, len(dropped), earliest_dropped)
 
 
 def run(days: int | None, output_dir: str, extract_all: bool,
@@ -362,60 +452,68 @@ def run(days: int | None, output_dir: str, extract_all: bool,
 
     project_stats = []
     skipped_count = 0
+    seen_safe_names: dict[str, str] = {}  # safe_name -> original folder name
 
     for project_dir in sorted(claude_projects.iterdir()):
         if not project_dir.is_dir():
             continue
 
-        # Deduplication: skip projects whose JSONL files haven't changed
         safe_name_check = folder_to_safe_filename(project_dir.name)
-        if not force:
-            current_mtime = get_max_jsonl_mtime(project_dir)
-            last_sync_mtime = _read_last_sync(output_path, safe_name_check)
-            if current_mtime > 0 and current_mtime <= last_sync_mtime:
-                skipped_count += 1
-                continue
 
-        project_name, safe_name, conversations = extract_project(project_dir, cutoff)
+        # Deduplication: skip projects whose JSONL files haven't changed.
+        skip, _ = _should_skip_project(project_dir, output_path, safe_name_check, force)
+        if skip:
+            skipped_count += 1
+            continue
+
+        project_name, safe_name, conversations, max_mtime = extract_project(project_dir, cutoff)
 
         if not conversations:
             continue
 
-        digest = build_project_digest(project_name, conversations)
+        # Filename collision detection — two distinct source folders producing
+        # the same safe_name would silently overwrite each other.
+        if safe_name in seen_safe_names and seen_safe_names[safe_name] != project_dir.name:
+            import hashlib
+            suffix = hashlib.sha1(project_dir.name.encode()).hexdigest()[:6]
+            safe_name = f"{safe_name}-{suffix}"
+            print(f"  Collision: {project_dir.name} -> {safe_name}.md (suffixed)", file=sys.stderr)
+        seen_safe_names[safe_name] = project_dir.name
+
+        # Size cap — single final build, O(n) measurement
+        kept, dropped_count, earliest_dropped = _trim_to_size(
+            project_name, conversations, max_size_bytes
+        )
+        digest = build_project_digest(project_name, kept)
+        if dropped_count:
+            note = (
+                f"\n\n> **Note:** {dropped_count} older session(s) trimmed "
+                f"(earliest dropped: {earliest_dropped}) to stay under {max_size_mb}MB limit.\n"
+            )
+            digest = digest + note
+            print(f"  {project_name}: trimmed {dropped_count} old session(s) (before {earliest_dropped})", file=sys.stderr)
+
         digest_bytes = len(digest.encode("utf-8"))
-
-        # Cap digest size by dropping oldest sessions
-        if digest_bytes > max_size_bytes and len(conversations) > 1:
-            conversations.sort(key=lambda c: c["latest"], reverse=True)
-            kept = []
-            running_size = 0
-            for conv in conversations:
-                conv_digest = build_project_digest(project_name, [conv])
-                conv_size = len(conv_digest.encode("utf-8"))
-                if running_size + conv_size > max_size_bytes and kept:
-                    break
-                kept.append(conv)
-                running_size += conv_size
-
-            dropped = len(conversations) - len(kept)
-            kept.reverse()
-            digest = build_project_digest(project_name, kept)
-            digest_bytes = len(digest.encode("utf-8"))
-
-            if dropped:
-                note = f"\n\n> **Note:** {dropped} older session(s) trimmed to stay under {max_size_mb}MB limit.\n"
-                digest = digest + note
-
-            print(f"  {project_name}: trimmed {dropped} old session(s) to fit size cap", file=sys.stderr)
-
         digest_file = output_path / f"{safe_name}.md"
-        digest_file.write_text(digest, encoding="utf-8")
 
-        # Record the latest JSONL mtime so we can skip this project next time
-        current_mtime = get_max_jsonl_mtime(project_dir)
-        if current_mtime > 0:
-            _write_last_sync(output_path, safe_name, current_mtime)
+        # Skip write if content is byte-identical to existing digest.
+        if digest_file.exists():
+            try:
+                if digest_file.read_text(encoding="utf-8") == digest:
+                    # Still record mtime so next run can skip the project.
+                    if max_mtime > 0:
+                        _write_last_sync(output_path, safe_name, max_mtime)
+                    continue
+            except OSError:
+                pass
 
+        atomic_write_text(digest_file, digest)
+
+        # Record the latest JSONL mtime (sampled during extract_project — no re-traversal).
+        if max_mtime > 0:
+            _write_last_sync(output_path, safe_name, max_mtime)
+
+        conversations = kept
         total_messages = sum(len(c["messages"]) for c in conversations)
         file_size_kb = digest_bytes / 1024
 

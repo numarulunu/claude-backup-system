@@ -338,6 +338,84 @@ class TestDeduplication:
     def test_get_max_jsonl_mtime_empty_dir(self, tmp_path):
         assert memory_sync.get_max_jsonl_mtime(tmp_path) == 0.0
 
+    def _setup_project(self, tmp_path, timestamp="2026-01-15T10:00:00Z"):
+        """Create a minimal fake claude_projects/project_dir with one JSONL."""
+        projects = tmp_path / "projects"
+        project_dir = projects / "C--Users-test-Desktop-Demo"
+        project_dir.mkdir(parents=True)
+        (project_dir / "a.jsonl").write_text(
+            make_jsonl_entry("user", "hello", timestamp) + "\n"
+        )
+        return projects, project_dir
+
+    def test_run_skips_project_when_last_sync_current(self, tmp_path, monkeypatch):
+        projects, project_dir = self._setup_project(tmp_path)
+        output = tmp_path / "digests"
+        output.mkdir()
+        safe = memory_sync.folder_to_safe_filename(project_dir.name)
+        # Seed .last_sync with a future timestamp so the project is skipped.
+        memory_sync._write_last_sync(output, safe, project_dir.glob("*.jsonl").__next__().stat().st_mtime + 100)
+        monkeypatch.setattr(memory_sync, "find_claude_projects_dir", lambda: projects)
+
+        memory_sync.run(days=None, output_dir=str(output), extract_all=True)
+
+        assert not (output / f"{safe}.md").exists()
+
+    def test_run_processes_project_when_jsonl_newer(self, tmp_path, monkeypatch):
+        projects, project_dir = self._setup_project(tmp_path)
+        output = tmp_path / "digests"
+        output.mkdir()
+        safe = memory_sync.folder_to_safe_filename(project_dir.name)
+        memory_sync._write_last_sync(output, safe, 1.0)  # Ancient
+        monkeypatch.setattr(memory_sync, "find_claude_projects_dir", lambda: projects)
+
+        memory_sync.run(days=None, output_dir=str(output), extract_all=True)
+
+        assert (output / f"{safe}.md").exists()
+
+    def test_run_force_bypasses_skip(self, tmp_path, monkeypatch):
+        projects, project_dir = self._setup_project(tmp_path)
+        output = tmp_path / "digests"
+        output.mkdir()
+        safe = memory_sync.folder_to_safe_filename(project_dir.name)
+        memory_sync._write_last_sync(output, safe, 9999999999.0)  # Future
+        monkeypatch.setattr(memory_sync, "find_claude_projects_dir", lambda: projects)
+
+        memory_sync.run(days=None, output_dir=str(output), extract_all=True, force=True)
+
+        assert (output / f"{safe}.md").exists()
+
+
+class TestTrimToSize:
+    def _make_conv(self, file_name, when, text="x" * 500):
+        return {
+            "file": file_name,
+            "messages": [{"role": "user", "text": text, "timestamp": when,
+                          "input_tokens": 0, "output_tokens": 0}],
+            "earliest": when,
+            "latest": when,
+        }
+
+    def test_no_trim_when_under_cap(self):
+        c = [self._make_conv("a.jsonl", datetime(2026, 1, 1, tzinfo=timezone.utc))]
+        kept, dropped, earliest = memory_sync._trim_to_size("P", c, 10_000_000)
+        assert len(kept) == 1
+        assert dropped == 0
+        assert earliest is None
+
+    def test_drops_oldest_and_reports_earliest(self):
+        convs = [
+            self._make_conv("old.jsonl", datetime(2026, 1, 1, tzinfo=timezone.utc), text="x" * 2000),
+            self._make_conv("mid.jsonl", datetime(2026, 2, 1, tzinfo=timezone.utc), text="x" * 2000),
+            self._make_conv("new.jsonl", datetime(2026, 3, 1, tzinfo=timezone.utc), text="x" * 2000),
+        ]
+        kept, dropped, earliest = memory_sync._trim_to_size("P", convs, 3000)
+        assert dropped >= 1
+        assert earliest == "2026-01-01"
+        # Kept sessions should be the most recent ones
+        latest_ts = [c["latest"] for c in kept]
+        assert max(latest_ts) == datetime(2026, 3, 1, tzinfo=timezone.utc)
+
 
 class TestFormatTokenCount:
     def test_small(self):
