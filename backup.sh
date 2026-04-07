@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Ensure core utils are on PATH BEFORE set -e (Windows Task Scheduler may invoke with empty PATH)
-export PATH="/usr/bin:/bin:/c/Program Files/Git/usr/bin:/c/Program Files/Git/bin:/c/Program Files/Git/mingw64/bin:/mingw64/bin:${PATH:-}"
+export PATH="/usr/bin:/bin:/c/Program Files/Git/usr/bin:/c/Program Files/Git/bin:/c/Program Files/Git/mingw64/bin:/mingw64/bin:/c/Users/Gaming PC/AppData/Local/Microsoft/WinGet/Links:${PATH:-}"
 
 set -euo pipefail
 
@@ -14,14 +14,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$SCRIPT_DIR/_backup.log"
-LOCKFILE="$SCRIPT_DIR/.backup.lock"
+LOCKDIR="$SCRIPT_DIR/.backup.lock.d"
 
-# Concurrency guard — abort if another run is in progress
-exec 9>"$LOCKFILE"
-if ! flock -n 9; then
-    echo "backup.sh: another run is in progress, exiting" >&2
-    exit 0
+# Concurrency guard — portable mkdir-based lock (atomic on all platforms).
+# flock is unavailable on Git Bash for Windows, so we don't use it.
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    # Stale lock? If the dir is >2h old, assume a previous run crashed.
+    if [ -d "$LOCKDIR" ]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$LOCKDIR" 2>/dev/null || echo 0) ))
+        if [ "$age" -gt 7200 ]; then
+            rm -rf "$LOCKDIR"
+            mkdir "$LOCKDIR" || { echo "backup.sh: could not acquire lock" >&2; exit 0; }
+        else
+            echo "backup.sh: another run is in progress (lock age ${age}s), exiting" >&2
+            exit 0
+        fi
+    fi
 fi
+trap 'rm -rf "$LOCKDIR"' EXIT INT TERM
 
 # Shared helpers
 # shellcheck source=_detect-python.sh
@@ -107,25 +117,45 @@ else
     log_warn "No memory files found"
 fi
 
-# Sync Kontext database (SQLite online backup API — WAL-safe)
-KONTEXT_DB="${KONTEXT_DB:-$HOME/Desktop/Claude/Kontext/kontext.db}"
-if [ -f "$KONTEXT_DB" ]; then
-    if command -v sqlite3 &>/dev/null; then
-        if sqlite3 "$KONTEXT_DB" ".backup '$CONFIG_DIR/kontext.db.tmp'" 2>/dev/null \
-            && mv -f "$CONFIG_DIR/kontext.db.tmp" "$CONFIG_DIR/kontext.db"; then
-            log_ok "kontext.db backed up (online backup API)"
+# Sync SQLite databases (online backup API — WAL-safe)
+# Each entry: "source_path|dest_name"
+DB_BACKUPS=(
+    "$HOME/Desktop/Claude/Kontext/kontext.db|kontext.db"
+    "$HOME/Desktop/Claude/Skool/db/pedagogy.db|skool-pedagogy.db"
+    "$HOME/Desktop/Claude/Skool/db/voice.db|skool-voice.db"
+)
+
+SQLITE_AVAILABLE=0
+command -v sqlite3 &>/dev/null && SQLITE_AVAILABLE=1
+
+mkdir -p "$CONFIG_DIR/db"
+
+for entry in "${DB_BACKUPS[@]}"; do
+    src="${entry%%|*}"
+    dest_name="${entry##*|}"
+    dest="$CONFIG_DIR/db/$dest_name"
+    label="${dest_name%.db}"
+
+    if [ ! -f "$src" ]; then
+        log_warn "$label: source not found at ${src/#$HOME/~}"
+        continue
+    fi
+
+    if [ "$SQLITE_AVAILABLE" -eq 1 ]; then
+        # sqlite3.exe needs Windows paths, not Git Bash POSIX paths.
+        src_win=$(cygpath -m "$src" 2>/dev/null || echo "$src")
+        dest_win=$(cygpath -m "${dest}.tmp" 2>/dev/null || echo "${dest}.tmp")
+        if sqlite3 "$src_win" ".backup '$dest_win'" 2>/dev/null && mv -f "${dest}.tmp" "$dest"; then
+            log_ok "$label backed up (online backup API)"
         else
-            rm -f "$CONFIG_DIR/kontext.db.tmp"
-            log_warn "sqlite3 .backup failed for kontext.db"
+            rm -f "${dest}.tmp"
+            log_fail "$label: sqlite3 .backup failed"
         fi
     else
-        # Fallback: plain cp. WAL may be inconsistent but better than nothing.
-        cp "$KONTEXT_DB" "$CONFIG_DIR/kontext.db"
-        log_warn "kontext.db copied via cp (sqlite3 CLI not found — WAL may be inconsistent)"
+        cp "$src" "$dest"
+        log_warn "$label copied via cp (sqlite3 CLI not found — WAL may be inconsistent)"
     fi
-else
-    log_warn "kontext.db not found at ${KONTEXT_DB/#$HOME/~}"
-fi
+done
 
 # Sync conversations (incremental — only new/modified files)
 if $PYTHON "$SCRIPT_DIR/sync-conversations.py" "$PROJECTS_DIR" "$CONV_DIR"; then
